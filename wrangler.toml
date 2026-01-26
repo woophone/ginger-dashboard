@@ -1,0 +1,30 @@
+name = "ginger-dashboard"
+account_id = "f09bbb81e8be554d6e67b5de063d8925"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "ginger-dashboard-db"
+database_id = "56fd5b1c-e51e-46d6-ad60-76cff6f4bad6"  # Will be filled after creation
+
+# Durable Objects
+[[durable_objects.bindings]]
+name = "DASHBOARD_ROOM"
+class_name = "DashboardRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DashboardRoom"]
+
+[env.staging]
+name = "ginger-dashboard-staging"
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "ginger-dashboard-db-staging"
+database_id = "56fd5b1c-e51e-46d6-ad60-76cff6f4bad6"  # Will be filled after creation
+
+[[env.staging.durable_objects.bindings]]
+name = "DASHBOARD_ROOM"
+class_name = "DashboardRoom"
