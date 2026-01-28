@@ -237,6 +237,109 @@ app.post("/api/features", async (c) => {
   return c.json({ success: true });
 });
 
+// =============
+// LEADS API
+// =============
+
+// Get all leads
+app.get("/api/leads", async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT * FROM leads ORDER BY created_at DESC"
+  ).all();
+  return c.json(results);
+});
+
+// Create lead
+app.post("/api/leads", async (c) => {
+  const body = await c.req.json();
+  const { id, source, businessType, name, phone, email, facebookUrl, status, notes } = body;
+
+  const leadId = id || crypto.randomUUID();
+
+  await c.env.DB.prepare(`
+    INSERT INTO leads (id, source, business_type, name, phone, email, facebook_url, status, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    leadId,
+    source,
+    businessType,
+    name,
+    phone || null,
+    email || null,
+    facebookUrl || null,
+    status || "new",
+    notes || null
+  ).run();
+
+  // Notify connected clients
+  const roomId = c.env.DASHBOARD_ROOM.idFromName("main");
+  const room = c.env.DASHBOARD_ROOM.get(roomId);
+  await room.fetch(new Request("http://internal/broadcast", {
+    method: "POST",
+    body: JSON.stringify({ type: "lead_created", leadId })
+  }));
+
+  return c.json({ success: true, id: leadId });
+});
+
+// Update lead
+app.patch("/api/leads/:id", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json();
+  const { status, notes, name, phone, email, facebookUrl, source, businessType } = body;
+
+  // Build dynamic update
+  const updates: string[] = [];
+  const values: (string | null)[] = [];
+
+  if (status !== undefined) { updates.push("status = ?"); values.push(status); }
+  if (notes !== undefined) { updates.push("notes = ?"); values.push(notes || null); }
+  if (name !== undefined) { updates.push("name = ?"); values.push(name); }
+  if (phone !== undefined) { updates.push("phone = ?"); values.push(phone || null); }
+  if (email !== undefined) { updates.push("email = ?"); values.push(email || null); }
+  if (facebookUrl !== undefined) { updates.push("facebook_url = ?"); values.push(facebookUrl || null); }
+  if (source !== undefined) { updates.push("source = ?"); values.push(source); }
+  if (businessType !== undefined) { updates.push("business_type = ?"); values.push(businessType); }
+
+  if (updates.length === 0) {
+    return c.json({ error: "No fields to update" }, 400);
+  }
+
+  updates.push("updated_at = datetime('now')");
+  values.push(id);
+
+  await c.env.DB.prepare(
+    `UPDATE leads SET ${updates.join(", ")} WHERE id = ?`
+  ).bind(...values).run();
+
+  // Notify connected clients
+  const roomId = c.env.DASHBOARD_ROOM.idFromName("main");
+  const room = c.env.DASHBOARD_ROOM.get(roomId);
+  await room.fetch(new Request("http://internal/broadcast", {
+    method: "POST",
+    body: JSON.stringify({ type: "lead_updated", leadId: id })
+  }));
+
+  return c.json({ success: true });
+});
+
+// Delete lead
+app.delete("/api/leads/:id", async (c) => {
+  const id = c.req.param("id");
+
+  await c.env.DB.prepare("DELETE FROM leads WHERE id = ?").bind(id).run();
+
+  // Notify connected clients
+  const roomId = c.env.DASHBOARD_ROOM.idFromName("main");
+  const room = c.env.DASHBOARD_ROOM.get(roomId);
+  await room.fetch(new Request("http://internal/broadcast", {
+    method: "POST",
+    body: JSON.stringify({ type: "lead_deleted", leadId: id })
+  }));
+
+  return c.json({ success: true });
+});
+
 // WebSocket for live updates
 app.get("/api/ws", async (c) => {
   const upgradeHeader = c.req.header("Upgrade");
@@ -360,7 +463,7 @@ function getDashboardHTML(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ginger's Projects</title>
+  <title>Ginger's Dashboard</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -374,7 +477,7 @@ function getDashboardHTML(): string {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 30px;
+      margin-bottom: 20px;
       padding-bottom: 20px;
       border-bottom: 1px solid #2a2a2a;
     }
@@ -393,6 +496,28 @@ function getDashboardHTML(): string {
       text-decoration: none;
     }
     .logout-btn:hover { color: #fff; }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 24px;
+      border-bottom: 1px solid #2a2a2a;
+      padding-bottom: 0;
+    }
+    .tab {
+      padding: 12px 24px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #666;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: all 0.2s;
+    }
+    .tab:hover { color: #888; }
+    .tab.active { color: #fff; border-bottom-color: #22c55e; }
+
     .projects-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
@@ -457,24 +582,356 @@ function getDashboardHTML(): string {
     .tested-badge.browser { background: #052e16; color: #22c55e; }
     .tested-badge.curl { background: #2d2a14; color: #ca8a04; }
     .tested-badge.local { background: #262626; color: #a3a3a3; }
+
+    /* Lead badges */
+    .badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      display: inline-block;
+      font-weight: 500;
+    }
+    .badge.new { background: #1e3a5f; color: #60a5fa; }
+    .badge.contacted { background: #422006; color: #fbbf24; }
+    .badge.responded { background: #2e1065; color: #c084fc; }
+    .badge.won { background: #052e16; color: #22c55e; }
+    .badge.lost { background: #262626; color: #9ca3af; }
+
+    .badge.dog-training { background: #1c1917; color: #fbbf24; }
+    .badge.bounce-house { background: #1e1b4b; color: #a5b4fc; }
+    .badge.web-design { background: #022c22; color: #34d399; }
+
+    .badge.source { background: #1f1f1f; color: #888; }
+
+    /* Lead form */
+    .lead-form {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .lead-form h3 { color: #fff; margin-bottom: 16px; font-size: 16px; }
+    .form-row {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .form-group {
+      flex: 1;
+      min-width: 150px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 4px;
+    }
+    .form-group input, .form-group select, .form-group textarea {
+      width: 100%;
+      padding: 8px 12px;
+      background: #0f0f0f;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 14px;
+    }
+    .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+      outline: none;
+      border-color: #3a3a3a;
+    }
+    .form-group textarea { resize: vertical; min-height: 60px; }
+    .form-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .btn {
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+    }
+    .btn-primary { background: #22c55e; color: #fff; }
+    .btn-primary:hover { background: #1ea550; }
+    .btn-secondary { background: #2a2a2a; color: #888; }
+    .btn-secondary:hover { background: #3a3a3a; color: #fff; }
+    .btn-danger { background: #7f1d1d; color: #fca5a5; }
+    .btn-danger:hover { background: #991b1b; }
+
+    /* Status dropdown in table */
+    .status-select {
+      padding: 4px 8px;
+      background: transparent;
+      border: 1px solid #2a2a2a;
+      border-radius: 4px;
+      color: #e0e0e0;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .status-select:focus { outline: none; border-color: #3a3a3a; }
+
+    .lead-contact {
+      font-size: 12px;
+      color: #666;
+    }
+    .lead-contact a { color: #60a5fa; text-decoration: none; }
+    .lead-contact a:hover { text-decoration: underline; }
+    .lead-notes {
+      font-size: 12px;
+      color: #888;
+      max-width: 200px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .lead-name { font-weight: 500; color: #fff; }
+    .lead-date { font-size: 12px; color: #525252; }
+
+    .add-lead-btn {
+      margin-bottom: 16px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #666;
+    }
+    .empty-state p { margin-bottom: 16px; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>🧡 Ginger's Projects</h1>
+    <h1>Ginger's Dashboard</h1>
     <div class="header-right">
       <span class="connection-status disconnected" id="status">Connecting...</span>
       <a href="/logout" class="logout-btn">Sign out</a>
     </div>
   </div>
-  <div id="app"><div class="loading">Loading projects...</div></div>
-  
+
+  <div class="tabs">
+    <div class="tab active" data-tab="leads" onclick="switchTab('leads')">LEADS</div>
+    <div class="tab" data-tab="projects" onclick="switchTab('projects')">PROJECTS</div>
+  </div>
+
+  <div id="app"><div class="loading">Loading...</div></div>
+
   <script>
     const app = document.getElementById('app');
     const statusEl = document.getElementById('status');
-    let currentView = 'projects';
+    let currentTab = 'leads';
+    let currentView = 'list';
     let currentProject = null;
-    
+    let leads = [];
+    let showAddForm = false;
+    let editingLead = null;
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector('.tab[data-tab="' + tab + '"]').classList.add('active');
+
+      if (tab === 'leads') {
+        loadLeads();
+        history.pushState({ tab: 'leads' }, '', '/?tab=leads');
+        document.title = 'Leads - Ginger\\'s Dashboard';
+      } else {
+        currentView = 'list';
+        currentProject = null;
+        loadProjects();
+        history.pushState({ tab: 'projects' }, '', '/?tab=projects');
+        document.title = 'Projects - Ginger\\'s Dashboard';
+      }
+    }
+
+    // ============= LEADS =============
+
+    async function loadLeads() {
+      try {
+        const res = await fetch('/api/leads');
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        leads = await res.json();
+        renderLeads();
+      } catch (e) {
+        app.innerHTML = '<div class="loading">Error loading leads</div>';
+      }
+    }
+
+    function renderLeads() {
+      let html = '';
+
+      // Add button
+      html += '<button class="btn btn-primary add-lead-btn" onclick="toggleAddForm()">+ Add Lead</button>';
+
+      // Add/Edit form
+      if (showAddForm || editingLead) {
+        const lead = editingLead || {};
+        html += '<div class="lead-form">';
+        html += '<h3>' + (editingLead ? 'Edit Lead' : 'New Lead') + '</h3>';
+        html += '<div class="form-row">';
+        html += '<div class="form-group"><label>Name *</label><input type="text" id="lead-name" value="' + escapeHtml(lead.name || '') + '" required></div>';
+        html += '<div class="form-group"><label>Business Type *</label><select id="lead-business">';
+        html += '<option value="dog-training"' + (lead.business_type === 'dog-training' ? ' selected' : '') + '>Dog Training</option>';
+        html += '<option value="bounce-house"' + (lead.business_type === 'bounce-house' ? ' selected' : '') + '>Bounce House</option>';
+        html += '<option value="web-design"' + (lead.business_type === 'web-design' ? ' selected' : '') + '>Web Design</option>';
+        html += '</select></div>';
+        html += '<div class="form-group"><label>Source *</label><input type="text" id="lead-source" value="' + escapeHtml(lead.source || '') + '" placeholder="facebook-group, referral, etc"></div>';
+        html += '</div>';
+        html += '<div class="form-row">';
+        html += '<div class="form-group"><label>Phone</label><input type="tel" id="lead-phone" value="' + escapeHtml(lead.phone || '') + '"></div>';
+        html += '<div class="form-group"><label>Email</label><input type="email" id="lead-email" value="' + escapeHtml(lead.email || '') + '"></div>';
+        html += '<div class="form-group"><label>Facebook URL</label><input type="url" id="lead-fb" value="' + escapeHtml(lead.facebook_url || '') + '"></div>';
+        html += '</div>';
+        html += '<div class="form-row">';
+        html += '<div class="form-group" style="flex:2"><label>Notes</label><textarea id="lead-notes">' + escapeHtml(lead.notes || '') + '</textarea></div>';
+        html += '</div>';
+        html += '<div class="form-actions">';
+        html += '<button class="btn btn-primary" onclick="saveLead()">' + (editingLead ? 'Update' : 'Add Lead') + '</button>';
+        html += '<button class="btn btn-secondary" onclick="cancelForm()">Cancel</button>';
+        if (editingLead) {
+          html += '<button class="btn btn-danger" onclick="deleteLead(\\'' + editingLead.id + '\\')">Delete</button>';
+        }
+        html += '</div></div>';
+      }
+
+      if (leads.length === 0 && !showAddForm) {
+        html += '<div class="empty-state"><p>No leads yet</p></div>';
+        app.innerHTML = html;
+        return;
+      }
+
+      // Leads table
+      html += '<table class="status-table"><thead><tr>';
+      html += '<th style="width:18%">Name</th>';
+      html += '<th style="width:12%">Business</th>';
+      html += '<th style="width:12%">Source</th>';
+      html += '<th style="width:12%">Status</th>';
+      html += '<th style="width:18%">Contact</th>';
+      html += '<th style="width:18%">Notes</th>';
+      html += '<th style="width:10%">Date</th>';
+      html += '</tr></thead><tbody>';
+
+      for (const lead of leads) {
+        html += '<tr onclick="editLead(\\'' + lead.id + '\\')" style="cursor:pointer">';
+        html += '<td><span class="lead-name">' + escapeHtml(lead.name) + '</span></td>';
+        html += '<td><span class="badge ' + lead.business_type + '">' + formatBusinessType(lead.business_type) + '</span></td>';
+        html += '<td><span class="badge source">' + escapeHtml(lead.source) + '</span></td>';
+        html += '<td><select class="status-select" onclick="event.stopPropagation()" onchange="updateLeadStatus(\\'' + lead.id + '\\', this.value)">';
+        html += '<option value="new"' + (lead.status === 'new' ? ' selected' : '') + '>New</option>';
+        html += '<option value="contacted"' + (lead.status === 'contacted' ? ' selected' : '') + '>Contacted</option>';
+        html += '<option value="responded"' + (lead.status === 'responded' ? ' selected' : '') + '>Responded</option>';
+        html += '<option value="won"' + (lead.status === 'won' ? ' selected' : '') + '>Won</option>';
+        html += '<option value="lost"' + (lead.status === 'lost' ? ' selected' : '') + '>Lost</option>';
+        html += '</select></td>';
+        html += '<td class="lead-contact">';
+        if (lead.phone) html += lead.phone + '<br>';
+        if (lead.email) html += '<a href="mailto:' + escapeHtml(lead.email) + '">' + escapeHtml(lead.email) + '</a><br>';
+        if (lead.facebook_url) html += '<a href="' + escapeHtml(lead.facebook_url) + '" target="_blank">Facebook</a>';
+        if (!lead.phone && !lead.email && !lead.facebook_url) html += '—';
+        html += '</td>';
+        html += '<td class="lead-notes" title="' + escapeHtml(lead.notes || '') + '">' + escapeHtml(lead.notes || '—') + '</td>';
+        html += '<td class="lead-date">' + formatDate(lead.created_at) + '</td>';
+        html += '</tr>';
+      }
+
+      html += '</tbody></table>';
+      app.innerHTML = html;
+    }
+
+    function toggleAddForm() {
+      showAddForm = !showAddForm;
+      editingLead = null;
+      renderLeads();
+    }
+
+    function cancelForm() {
+      showAddForm = false;
+      editingLead = null;
+      renderLeads();
+    }
+
+    function editLead(id) {
+      editingLead = leads.find(l => l.id === id);
+      showAddForm = false;
+      renderLeads();
+    }
+
+    async function saveLead() {
+      const name = document.getElementById('lead-name').value.trim();
+      const businessType = document.getElementById('lead-business').value;
+      const source = document.getElementById('lead-source').value.trim();
+      const phone = document.getElementById('lead-phone').value.trim();
+      const email = document.getElementById('lead-email').value.trim();
+      const facebookUrl = document.getElementById('lead-fb').value.trim();
+      const notes = document.getElementById('lead-notes').value.trim();
+
+      if (!name || !source) {
+        alert('Name and Source are required');
+        return;
+      }
+
+      const data = { name, businessType, source, phone, email, facebookUrl, notes };
+
+      try {
+        if (editingLead) {
+          await fetch('/api/leads/' + editingLead.id, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+        } else {
+          await fetch('/api/leads', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+        }
+        showAddForm = false;
+        editingLead = null;
+        await loadLeads();
+      } catch (e) {
+        alert('Error saving lead');
+      }
+    }
+
+    async function updateLeadStatus(id, status) {
+      try {
+        await fetch('/api/leads/' + id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status })
+        });
+        await loadLeads();
+      } catch (e) {
+        alert('Error updating status');
+      }
+    }
+
+    async function deleteLead(id) {
+      if (!confirm('Delete this lead?')) return;
+      try {
+        await fetch('/api/leads/' + id, { method: 'DELETE' });
+        editingLead = null;
+        await loadLeads();
+      } catch (e) {
+        alert('Error deleting lead');
+      }
+    }
+
+    function formatBusinessType(type) {
+      const map = {
+        'dog-training': 'Dog Training',
+        'bounce-house': 'Bounce House',
+        'web-design': 'Web Design'
+      };
+      return map[type] || type;
+    }
+
+    // ============= PROJECTS =============
+
     async function loadProjects() {
       try {
         const res = await fetch('/api/projects');
@@ -485,37 +942,34 @@ function getDashboardHTML(): string {
         app.innerHTML = '<div class="loading">Error loading projects</div>';
       }
     }
-    
+
     async function loadProject(id, skipPush) {
       try {
         const res = await fetch('/api/projects/' + id);
         if (res.status === 401) { window.location.href = '/login'; return; }
         const project = await res.json();
         if (project.error) {
-          // Project not found, go back to list
           backToProjects();
           return;
         }
         currentProject = project;
         currentView = 'project';
         renderProject(project);
-        // Update URL with project id (unless triggered by popstate)
         if (!skipPush) {
-          history.pushState({ project: id }, '', '?project=' + encodeURIComponent(id));
+          history.pushState({ tab: 'projects', project: id }, '', '?tab=projects&project=' + encodeURIComponent(id));
         }
-        // Update page title
-        document.title = project.name + ' - Ginger\\'s Projects';
+        document.title = project.name + ' - Ginger\\'s Dashboard';
       } catch (e) {
         app.innerHTML = '<div class="loading">Error loading project</div>';
       }
     }
-    
+
     function renderProjects(projects) {
       if (projects.length === 0) {
-        app.innerHTML = '<div class="loading">No projects yet</div>';
+        app.innerHTML = '<div class="empty-state"><p>No projects yet</p></div>';
         return;
       }
-      app.innerHTML = '<div class="projects-grid">' + projects.map(p => 
+      app.innerHTML = '<div class="projects-grid">' + projects.map(p =>
         '<div class="project-card" onclick="loadProject(\\'' + p.id + '\\')">' +
         '<div class="project-name">' + escapeHtml(p.name) + '</div>' +
         '<div class="project-desc">' + escapeHtml(p.description || '') + '</div>' +
@@ -523,7 +977,7 @@ function getDashboardHTML(): string {
         '</div>'
       ).join('') + '</div>';
     }
-    
+
     function renderProject(project) {
       const features = project.features || [];
       const sorted = features.sort((a, b) => {
@@ -531,67 +985,67 @@ function getDashboardHTML(): string {
         const bTime = Math.max(new Date(b.last_modified || 0).getTime(), new Date(b.last_tested || 0).getTime());
         return bTime - aTime;
       });
-      
+
       let html = '<span class="back-btn" onclick="backToProjects()">← All Projects</span>';
       html += '<h2 style="color:#fff;margin-bottom:8px;">' + escapeHtml(project.name) + '</h2>';
       if (project.staging_url) {
-        html += '<a href="' + project.staging_url + '" target="_blank" style="color:#60a5fa;font-size:13px;margin-bottom:16px;display:inline-block;">🚀 Open Staging</a>';
+        html += '<a href="' + project.staging_url + '" target="_blank" style="color:#60a5fa;font-size:13px;margin-bottom:16px;display:inline-block;">Open Staging</a>';
       }
       html += '<table class="status-table"><thead><tr>';
       html += '<th style="width:30%">Feature</th><th style="width:12%">Status</th><th style="width:20%">Tested</th><th style="width:19%">Last Modified</th><th style="width:19%">Last Tested</th>';
       html += '</tr></thead><tbody>';
-      
+
       for (const f of sorted) {
         const isStale = f.is_stale === 1;
         const dotClass = f.status === 'blocked' ? 'blocked' : f.status === 'not-started' ? 'not-started' : isStale ? 'stale' : 'ready';
         const testedBadge = f.last_test_type ? '<span class="tested-badge ' + f.last_test_type + '">' + f.last_test_target + ' (' + f.last_test_type + ')</span>' : '—';
-        
+
         html += '<tr>';
         html += '<td><span class="status-dot ' + dotClass + '"></span>' + escapeHtml(f.name);
-        if (f.blocker) html += '<div class="blocker-text">⚠️ ' + escapeHtml(f.blocker) + '</div>';
+        if (f.blocker) html += '<div class="blocker-text">' + escapeHtml(f.blocker) + '</div>';
         html += '</td>';
         html += '<td>' + escapeHtml(f.status) + '</td>';
         html += '<td>' + testedBadge;
-        if (isStale) html += '<span class="stale-warning">⚠️ code changed since test</span>';
+        if (isStale) html += '<span class="stale-warning">code changed since test</span>';
         html += '</td>';
         html += '<td>' + formatDateTime(f.last_modified) + '</td>';
         html += '<td>' + formatDateTime(f.last_tested) + '</td>';
         html += '</tr>';
       }
-      
+
       html += '</tbody></table>';
       app.innerHTML = html;
     }
-    
+
     function backToProjects(skipPush) {
-      currentView = 'projects';
+      currentView = 'list';
       currentProject = null;
       loadProjects();
-      // Clear URL params (unless triggered by popstate)
       if (!skipPush) {
-        history.pushState({}, '', '/');
+        history.pushState({ tab: 'projects' }, '', '?tab=projects');
       }
-      // Reset page title
-      document.title = 'Ginger\\'s Projects';
+      document.title = 'Projects - Ginger\\'s Dashboard';
     }
-    
+
+    // ============= UTILS =============
+
     function formatDate(d) {
       if (!d) return '—';
       const date = new Date(d);
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     }
-    
+
     function formatDateTime(d) {
       if (!d) return '—';
       const date = new Date(d);
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + '<br><span style="color:#525252;font-size:11px">' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) + '</span>';
     }
-    
+
     function escapeHtml(str) {
       if (!str) return '';
-      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
-    
+
     // WebSocket
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -606,35 +1060,59 @@ function getDashboardHTML(): string {
         setTimeout(connectWS, 3000);
       };
       ws.onmessage = () => {
-        if (currentView === 'projects') loadProjects();
-        else if (currentProject) loadProject(currentProject.id);
+        if (currentTab === 'leads') loadLeads();
+        else if (currentView === 'list') loadProjects();
+        else if (currentProject) loadProject(currentProject.id, true);
       };
     }
-    
-    // Handle browser back/forward buttons
+
+    // Handle browser back/forward
     window.addEventListener('popstate', function(e) {
-      if (e.state && e.state.project) {
-        loadProject(e.state.project, true);
-      } else {
-        backToProjects(true);
+      if (e.state) {
+        if (e.state.tab === 'leads') {
+          currentTab = 'leads';
+          document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+          document.querySelector('.tab[data-tab="leads"]').classList.add('active');
+          loadLeads();
+        } else if (e.state.tab === 'projects') {
+          currentTab = 'projects';
+          document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+          document.querySelector('.tab[data-tab="projects"]').classList.add('active');
+          if (e.state.project) {
+            loadProject(e.state.project, true);
+          } else {
+            backToProjects(true);
+          }
+        }
       }
     });
-    
-    // Check URL for project param on initial load
+
     function init() {
       const params = new URLSearchParams(window.location.search);
+      const tab = params.get('tab') || 'leads';
       const projectId = params.get('project');
-      if (projectId) {
-        // Replace initial state so back button works correctly
-        history.replaceState({ project: projectId }, '', '?project=' + encodeURIComponent(projectId));
-        loadProject(projectId, true);
+
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector('.tab[data-tab="' + tab + '"]').classList.add('active');
+
+      if (tab === 'leads') {
+        history.replaceState({ tab: 'leads' }, '', '/?tab=leads');
+        document.title = 'Leads - Ginger\\'s Dashboard';
+        loadLeads();
       } else {
-        history.replaceState({}, '', '/');
-        loadProjects();
+        if (projectId) {
+          history.replaceState({ tab: 'projects', project: projectId }, '', '?tab=projects&project=' + encodeURIComponent(projectId));
+          loadProject(projectId, true);
+        } else {
+          history.replaceState({ tab: 'projects' }, '', '?tab=projects');
+          document.title = 'Projects - Ginger\\'s Dashboard';
+          loadProjects();
+        }
       }
       connectWS();
     }
-    
+
     init();
   </script>
 </body>

@@ -68,8 +68,26 @@ SELECT
   END as is_stale
 FROM features f;
 
+-- Leads table (for tracking business leads)
+CREATE TABLE IF NOT EXISTS leads (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,              -- facebook-group, wudog-form, referral, etc
+  business_type TEXT NOT NULL,       -- dog-training, bounce-house, web-design
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  facebook_url TEXT,                 -- FB profile URL
+  status TEXT DEFAULT 'new',         -- new, contacted, responded, won, lost
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_features_project ON features(project_id);
 CREATE INDEX IF NOT EXISTS idx_test_logs_feature ON test_logs(feature_id);
 CREATE INDEX IF NOT EXISTS idx_test_logs_project ON test_logs(project_id);
 CREATE INDEX IF NOT EXISTS idx_file_changes_feature ON file_changes(feature_id);
+CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
+CREATE INDEX IF NOT EXISTS idx_leads_business_type ON leads(business_type);
+CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
