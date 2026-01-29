@@ -111,23 +111,27 @@ app.get("/api/projects", async (c) => {
   return c.json(results);
 });
 
-// Get single project with features
+// Get single project with features and considerations
 app.get("/api/projects/:id", async (c) => {
   const id = c.req.param("id");
-  
+
   const project = await c.env.DB.prepare(
     "SELECT * FROM projects WHERE id = ?"
   ).bind(id).first();
-  
+
   if (!project) {
     return c.json({ error: "Project not found" }, 404);
   }
-  
+
   const { results: features } = await c.env.DB.prepare(
-    "SELECT * FROM feature_status WHERE project_id = ? ORDER BY sort_order, name"
+    "SELECT * FROM feature_status WHERE project_id = ? ORDER BY category, subcategory, sort_order, name"
   ).bind(id).all();
-  
-  return c.json({ ...project, features });
+
+  const { results: considerations } = await c.env.DB.prepare(
+    "SELECT * FROM considerations WHERE project_id = ? ORDER BY created_at DESC"
+  ).bind(id).all();
+
+  return c.json({ ...project, features, considerations });
 });
 
 // Get feature with test history
@@ -201,13 +205,27 @@ app.post("/api/file-changes", async (c) => {
 app.patch("/api/features/:id", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json();
-  const { status, blocker } = body;
-  
-  await c.env.DB.prepare(`
-    UPDATE features SET status = ?, blocker = ?, updated_at = datetime('now')
-    WHERE id = ?
-  `).bind(status, blocker || null, id).run();
-  
+  const { status, blocker, category, subcategory } = body;
+
+  const updates: string[] = [];
+  const values: (string | null)[] = [];
+
+  if (status !== undefined) { updates.push("status = ?"); values.push(status); }
+  if (blocker !== undefined) { updates.push("blocker = ?"); values.push(blocker || null); }
+  if (category !== undefined) { updates.push("category = ?"); values.push(category || null); }
+  if (subcategory !== undefined) { updates.push("subcategory = ?"); values.push(subcategory || null); }
+
+  if (updates.length === 0) {
+    return c.json({ error: "No fields to update" }, 400);
+  }
+
+  updates.push("updated_at = datetime('now')");
+  values.push(id);
+
+  await c.env.DB.prepare(
+    `UPDATE features SET ${updates.join(", ")} WHERE id = ?`
+  ).bind(...values).run();
+
   return c.json({ success: true });
 });
 
@@ -227,13 +245,70 @@ app.post("/api/projects", async (c) => {
 // Create feature
 app.post("/api/features", async (c) => {
   const body = await c.req.json();
-  const { id, projectId, name, status, blocker, sortOrder } = body;
-  
+  const { id, projectId, name, status, blocker, sortOrder, category, subcategory } = body;
+
   await c.env.DB.prepare(`
-    INSERT INTO features (id, project_id, name, status, blocker, sort_order)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(id, projectId, name, status || "not-started", blocker || null, sortOrder || 0).run();
-  
+    INSERT INTO features (id, project_id, name, status, blocker, sort_order, category, subcategory)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(id, projectId, name, status || "not-started", blocker || null, sortOrder || 0, category || null, subcategory || null).run();
+
+  return c.json({ success: true });
+});
+
+// =============
+// CONSIDERATIONS API
+// =============
+
+// Create consideration
+app.post("/api/considerations", async (c) => {
+  const body = await c.req.json();
+  const { projectId, featureId, category, content } = body;
+
+  const id = crypto.randomUUID();
+
+  await c.env.DB.prepare(`
+    INSERT INTO considerations (id, project_id, feature_id, category, content)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(id, projectId, featureId || null, category || null, content).run();
+
+  const roomId = c.env.DASHBOARD_ROOM.idFromName("main");
+  const room = c.env.DASHBOARD_ROOM.get(roomId);
+  await room.fetch(new Request("http://internal/broadcast", {
+    method: "POST",
+    body: JSON.stringify({ type: "consideration_created", projectId })
+  }));
+
+  return c.json({ success: true, id });
+});
+
+// Update consideration
+app.patch("/api/considerations/:id", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json();
+  const { status, content } = body;
+
+  const updates: string[] = [];
+  const values: (string | null)[] = [];
+
+  if (status !== undefined) {
+    updates.push("status = ?");
+    values.push(status);
+    if (status === "resolved") {
+      updates.push("resolved_at = datetime('now')");
+    }
+  }
+  if (content !== undefined) { updates.push("content = ?"); values.push(content); }
+
+  if (updates.length === 0) {
+    return c.json({ error: "No fields to update" }, 400);
+  }
+
+  values.push(id);
+
+  await c.env.DB.prepare(
+    `UPDATE considerations SET ${updates.join(", ")} WHERE id = ?`
+  ).bind(...values).run();
+
   return c.json({ success: true });
 });
 
@@ -701,6 +776,59 @@ function getDashboardHTML(): string {
       color: #666;
     }
     .empty-state p { margin-bottom: 16px; }
+
+    /* Category grouping */
+    .category-group { margin-bottom: 4px; }
+    .category-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: #161616;
+      border: 1px solid #222;
+      border-radius: 8px;
+      cursor: pointer;
+      user-select: none;
+      margin-bottom: 2px;
+    }
+    .category-header:hover { background: #1c1c1c; }
+    .category-arrow {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+      width: 12px;
+    }
+    .category-arrow.collapsed { transform: rotate(-90deg); }
+    .category-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: #999;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .category-count {
+      font-size: 11px;
+      color: #555;
+      margin-left: 4px;
+    }
+    .category-body { overflow: hidden; }
+    .category-body.collapsed { display: none; }
+    .subcategory-header {
+      padding: 6px 16px 6px 36px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #666;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    .consideration-badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 8px;
+      background: #2d2006;
+      color: #f59e0b;
+      margin-left: 8px;
+      font-weight: 500;
+    }
   </style>
 </head>
 <body>
@@ -980,10 +1108,29 @@ function getDashboardHTML(): string {
 
     function renderProject(project) {
       const features = project.features || [];
-      const sorted = features.sort((a, b) => {
-        const aTime = Math.max(new Date(a.last_modified || 0).getTime(), new Date(a.last_tested || 0).getTime());
-        const bTime = Math.max(new Date(b.last_modified || 0).getTime(), new Date(b.last_tested || 0).getTime());
-        return bTime - aTime;
+      const considerations = project.considerations || [];
+
+      // Build pending consideration counts per feature
+      const pendingByFeature = {};
+      for (const con of considerations) {
+        if (con.status === 'pending' && con.feature_id) {
+          pendingByFeature[con.feature_id] = (pendingByFeature[con.feature_id] || 0) + 1;
+        }
+      }
+
+      // Group features by category
+      const groups = {};
+      for (const f of features) {
+        const cat = f.category || '__uncategorized__';
+        if (!groups[cat]) groups[cat] = [];
+        groups[cat].push(f);
+      }
+
+      // Sort categories: named first alphabetically, uncategorized last
+      const catKeys = Object.keys(groups).sort((a, b) => {
+        if (a === '__uncategorized__') return 1;
+        if (b === '__uncategorized__') return -1;
+        return a.localeCompare(b);
       });
 
       let html = '<span class="back-btn" onclick="backToProjects()">← All Projects</span>';
@@ -991,30 +1138,83 @@ function getDashboardHTML(): string {
       if (project.staging_url) {
         html += '<a href="' + project.staging_url + '" target="_blank" style="color:#60a5fa;font-size:13px;margin-bottom:16px;display:inline-block;">Open Staging</a>';
       }
-      html += '<table class="status-table"><thead><tr>';
-      html += '<th style="width:30%">Feature</th><th style="width:12%">Status</th><th style="width:20%">Tested</th><th style="width:19%">Last Modified</th><th style="width:19%">Last Tested</th>';
-      html += '</tr></thead><tbody>';
 
-      for (const f of sorted) {
-        const isStale = f.is_stale === 1;
-        const dotClass = f.status === 'blocked' ? 'blocked' : f.status === 'not-started' ? 'not-started' : isStale ? 'stale' : 'ready';
-        const testedBadge = f.last_test_type ? '<span class="tested-badge ' + f.last_test_type + '">' + f.last_test_target + ' (' + f.last_test_type + ')</span>' : '—';
+      for (const cat of catKeys) {
+        const catFeatures = groups[cat];
+        const catLabel = cat === '__uncategorized__' ? 'Uncategorized' : cat;
+        const catId = 'cat-' + cat.replace(/[^a-zA-Z0-9]/g, '_');
 
-        html += '<tr>';
-        html += '<td><span class="status-dot ' + dotClass + '"></span>' + escapeHtml(f.name);
-        if (f.blocker) html += '<div class="blocker-text">' + escapeHtml(f.blocker) + '</div>';
-        html += '</td>';
-        html += '<td>' + escapeHtml(f.status) + '</td>';
-        html += '<td>' + testedBadge;
-        if (isStale) html += '<span class="stale-warning">code changed since test</span>';
-        html += '</td>';
-        html += '<td>' + formatDateTime(f.last_modified) + '</td>';
-        html += '<td>' + formatDateTime(f.last_tested) + '</td>';
-        html += '</tr>';
+        html += '<div class="category-group">';
+        html += '<div class="category-header" onclick="toggleCategory(\\'' + catId + '\\')">';
+        html += '<span class="category-arrow" id="arrow-' + catId + '">▼</span>';
+        html += '<span class="category-name">' + escapeHtml(catLabel) + '</span>';
+        html += '<span class="category-count">' + catFeatures.length + '</span>';
+        html += '</div>';
+        html += '<div class="category-body" id="body-' + catId + '">';
+
+        // Group by subcategory within category
+        const subgroups = {};
+        for (const f of catFeatures) {
+          const sub = f.subcategory || '__none__';
+          if (!subgroups[sub]) subgroups[sub] = [];
+          subgroups[sub].push(f);
+        }
+        const subKeys = Object.keys(subgroups).sort((a, b) => {
+          if (a === '__none__') return -1;
+          if (b === '__none__') return 1;
+          return a.localeCompare(b);
+        });
+
+        html += '<table class="status-table"><thead><tr>';
+        html += '<th style="width:30%">Feature</th><th style="width:12%">Status</th><th style="width:20%">Tested</th><th style="width:19%">Last Modified</th><th style="width:19%">Last Tested</th>';
+        html += '</tr></thead><tbody>';
+
+        for (const sub of subKeys) {
+          if (sub !== '__none__') {
+            html += '<tr><td colspan="5" class="subcategory-header">' + escapeHtml(sub) + '</td></tr>';
+          }
+          for (const f of subgroups[sub]) {
+            const isStale = f.is_stale === 1;
+            const dotClass = f.status === 'blocked' ? 'blocked' : f.status === 'not-started' ? 'not-started' : isStale ? 'stale' : 'ready';
+            const testedBadge = f.last_test_type ? '<span class="tested-badge ' + f.last_test_type + '">' + f.last_test_target + ' (' + f.last_test_type + ')</span>' : '—';
+            const pendingCount = pendingByFeature[f.id] || 0;
+
+            html += '<tr>';
+            html += '<td><span class="status-dot ' + dotClass + '"></span>' + escapeHtml(f.name);
+            if (pendingCount > 0) html += '<span class="consideration-badge">' + pendingCount + '</span>';
+            if (f.blocker) html += '<div class="blocker-text">' + escapeHtml(f.blocker) + '</div>';
+            html += '</td>';
+            html += '<td>' + escapeHtml(f.status) + '</td>';
+            html += '<td>' + testedBadge;
+            if (isStale) html += '<span class="stale-warning">code changed since test</span>';
+            html += '</td>';
+            html += '<td>' + formatDateTime(f.last_modified) + '</td>';
+            html += '<td>' + formatDateTime(f.last_tested) + '</td>';
+            html += '</tr>';
+          }
+        }
+
+        html += '</tbody></table>';
+        html += '</div></div>';
       }
 
-      html += '</tbody></table>';
+      if (features.length === 0) {
+        html += '<div class="empty-state"><p>No features yet</p></div>';
+      }
+
       app.innerHTML = html;
+    }
+
+    function toggleCategory(catId) {
+      const body = document.getElementById('body-' + catId);
+      const arrow = document.getElementById('arrow-' + catId);
+      if (body.classList.contains('collapsed')) {
+        body.classList.remove('collapsed');
+        arrow.classList.remove('collapsed');
+      } else {
+        body.classList.add('collapsed');
+        arrow.classList.add('collapsed');
+      }
     }
 
     function backToProjects(skipPush) {
